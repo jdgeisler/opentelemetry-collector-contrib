@@ -4,6 +4,7 @@
 package translator // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/datadogreceiver/internal/translator"
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/DataDog/agent-payload/v5/gogen"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV1"
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
@@ -27,6 +29,10 @@ type SeriesList struct {
 	Series []datadogV1.Series `json:"series"`
 }
 
+type SeriesListV2 struct {
+	Series []datadogV2.MetricSeries `json:"series"`
+}
+
 // TODO: add handling for JSON format in additional to protobuf?
 func (mt *MetricsTranslator) HandleSeriesV2Payload(req *http.Request) (mp []*gogen.MetricPayload_MetricSeries, err error) {
 	buf := GetBuffer()
@@ -41,6 +47,21 @@ func (mt *MetricsTranslator) HandleSeriesV2Payload(req *http.Request) (mp []*gog
 	}
 
 	return pl.GetSeries(), nil
+}
+
+func (mt *MetricsTranslator) HandleSeriesV2PayloadJSON(req *http.Request) (mp SeriesListV2, err error) {
+	buf := GetBuffer()
+	defer PutBuffer(buf)
+	if _, err := io.Copy(buf, req.Body); err != nil {
+		return mp, err
+	}
+
+	seriesListV2 := SeriesListV2{}
+	if err := json.Unmarshal(buf.Bytes(), &seriesListV2); err != nil {
+		return mp, err
+	}
+
+	return seriesListV2, nil
 }
 
 func (mt *MetricsTranslator) TranslateSeriesV1(series SeriesList) pmetric.Metrics {
@@ -165,10 +186,90 @@ func (mt *MetricsTranslator) TranslateSeriesV2(series []*gogen.MetricPayload_Met
 	return bt.Metrics
 }
 
+func (mt *MetricsTranslator) TranslateSeriesV2JSON(series SeriesListV2) pmetric.Metrics {
+	bt := newBatcher()
+
+	for _, serie := range series.Series {
+		var dps pmetric.NumberDataPointSlice
+
+		// The V2 payload stores the host name under in the Resources field
+		resourceMap := getV2ResourcesJSON(serie.Resources)
+		seriesType := metricIntakeTypeToString(*serie.Type)
+		// TODO(jesus.vazquez) (Do this with string interning)
+		dimensions := parseSeriesProperties(serie.Metric, seriesType, serie.Tags, resourceMap["host"], mt.buildInfo.Version, mt.stringPool)
+		for k, v := range resourceMap {
+			if k == "host" {
+				continue // Host has already been added as a resource attribute in parseSeriesProperties(), so avoid duplicating that attribute
+			}
+			dimensions.resourceAttrs.PutStr(k, v)
+		}
+		sourceType := serie.GetSourceTypeName()
+		dimensions.resourceAttrs.PutStr("source", sourceType) //TODO: check if this is correct handling of SourceTypeName field
+		metric, metricID := bt.Lookup(dimensions)
+
+		switch seriesType {
+		case TypeCount:
+			metric.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			metric.Sum().SetIsMonotonic(false) // See https://docs.datadoghq.com/metrics/types/?tab=count#definition
+			dps = metric.Sum().DataPoints()
+		case TypeGauge:
+			dps = metric.Gauge().DataPoints()
+		case TypeRate:
+			metric.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityDelta) //TODO: verify that this is always the case
+			dps = metric.Sum().DataPoints()
+		default:
+			// Type is unset/unspecified
+			continue
+		}
+
+		dps.EnsureCapacity(len(serie.Points))
+
+		for _, point := range serie.Points {
+			dp := dps.AppendEmpty()
+			dp.SetTimestamp(pcommon.Timestamp(*point.Timestamp * time.Second.Nanoseconds())) // OTel uses nanoseconds, while Datadog uses seconds
+			dimensions.dpAttrs.CopyTo(dp.Attributes())                                       // TODO(jesus.vazquez) Review this copy
+			val := point.Value
+			if seriesType == TypeRate && serie.Interval != nil {
+				*val *= float64(*serie.Interval)
+			}
+			dp.SetDoubleValue(*val)
+
+			stream := identity.OfStream(metricID, dp)
+			ts, ok := mt.streamHasTimestamp(stream)
+			if ok {
+				dp.SetStartTimestamp(ts)
+			}
+			mt.updateLastTsForStream(stream, dp.Timestamp())
+		}
+	}
+	return bt.Metrics
+}
+
 func getV2Resources(resources []*gogen.MetricPayload_Resource) map[string]string {
 	resourceMap := make(map[string]string)
 	for i := range resources {
 		resourceMap[resources[i].Type] = resources[i].Name
 	}
 	return resourceMap
+}
+
+func getV2ResourcesJSON(resources []datadogV2.MetricResource) map[string]string {
+	resourceMap := make(map[string]string)
+	for i := range resources {
+		resourceMap[*resources[i].Type] = *resources[i].Name
+	}
+	return resourceMap
+}
+
+func metricIntakeTypeToString(intakeType datadogV2.MetricIntakeType) string {
+	switch intakeType {
+	case datadogV2.METRICINTAKETYPE_COUNT:
+		return "count"
+	case datadogV2.METRICINTAKETYPE_GAUGE:
+		return "gauge"
+	case datadogV2.METRICINTAKETYPE_RATE:
+		return "rate"
+	default:
+		return "unspecified"
+	}
 }

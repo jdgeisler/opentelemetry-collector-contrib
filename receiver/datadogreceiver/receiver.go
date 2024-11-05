@@ -314,20 +314,40 @@ func (ddr *datadogReceiver) handleV2Series(w http.ResponseWriter, req *http.Requ
 		ddr.tReceiver.EndMetricsOp(obsCtx, "datadog", *metricsCount, err)
 	}(&metricsCount)
 
-	series, err := ddr.metricsTranslator.HandleSeriesV2Payload(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		ddr.params.Logger.Error(err.Error())
-		return
-	}
-
-	metrics := ddr.metricsTranslator.TranslateSeriesV2(series)
-	metricsCount = metrics.DataPointCount()
-
-	err = ddr.nextMetricsConsumer.ConsumeMetrics(obsCtx, metrics)
-	if err != nil {
-		errorutil.HTTPError(w, err)
-		ddr.params.Logger.Error("metrics consumer errored out", zap.Error(err))
+	contentType := req.Header.Get("Content-Type")
+	switch contentType {
+	case "application/json":
+		series, err := ddr.metricsTranslator.HandleSeriesV2PayloadJSON(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			ddr.params.Logger.Error(err.Error())
+			return
+		}
+		metrics := ddr.metricsTranslator.TranslateSeriesV2JSON(series)
+		metricsCount = metrics.DataPointCount()
+		err = ddr.nextMetricsConsumer.ConsumeMetrics(obsCtx, metrics)
+		if err != nil {
+			errorutil.HTTPError(w, err)
+			ddr.params.Logger.Error("metrics consumer errored out", zap.Error(err))
+			return
+		}
+	case "application/protobuf":
+		series, err := ddr.metricsTranslator.HandleSeriesV2Payload(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			ddr.params.Logger.Error(err.Error())
+			return
+		}
+		metrics := ddr.metricsTranslator.TranslateSeriesV2(series)
+		metricsCount = metrics.DataPointCount()
+		err = ddr.nextMetricsConsumer.ConsumeMetrics(obsCtx, metrics)
+		if err != nil {
+			errorutil.HTTPError(w, err)
+			ddr.params.Logger.Error("metrics consumer errored out", zap.Error(err))
+			return
+		}
+	default:
+		http.Error(w, "Unsupported Content-Type", http.StatusUnsupportedMediaType)
 		return
 	}
 
